@@ -91,6 +91,96 @@ python src/alpamayo1_5/test_inference.py
 In case you would like to obtain more trajectories and reasoning traces, please feel free to increase
 the `num_traj_samples` argument in the script.
 
+### Tracked runs (ML_Platform)
+
+`scripts/run_inference_tracked.py` is the test script above, wired to the MLflow
+tracking server so a run can be traced back later: which commit, which data, which
+model, how well.
+
+```bash
+pip install "mlflow>=3"
+export MLFLOW_TRACKING_URI=http://ysh-jetson-orin-nano.tail4570ef.ts.net:5000
+git commit -am "..."                       # dirty runs are not reproducible
+python scripts/run_inference_tracked.py --notes "baseline before KD"
+```
+
+Run it from the repository root -- MLflow reads `cwd` to autolog the git commit, and
+that tag outranks anything set by hand. The tracking server is Tailscale-only; from
+outside the tailnet, forward it with
+`ssh -N -L 5000:100.81.70.49:5000 <relay>` and use `http://localhost:5000`.
+
+| Flag | Default | |
+|---|---|---|
+| `--clip-id` | one example clip | repeat for several clips |
+| `--num-traj-samples` | `1` | trajectories sampled per clip |
+| `--model` | `nvidia/Alpamayo-1.5-10B` | HF repo id, or a local checkpoint path |
+| `--run-type` | `eval` | `infer` when predictions are not scored |
+| `--experiment` / `--project` | `alpamayo-kd` | the project, not the run |
+| `--evals-repo` | `YSHRobotics/alpamayo-kd-evals` | private HF repo receiving the run directory |
+| `--notes` | -- | one or two human sentences; this is what makes a run readable later |
+| `--include-gt` | off | also store the logged future (gated-dataset content) |
+| `--no-samples` / `--no-upload` / `--no-track` | off | skip visualizations / Hugging Face / MLflow |
+
+The dataset carries the logged future trajectory, so minADE is computable and the run
+is recorded as an `eval` with `score` = mean minADE in meters (lower is better).
+
+Each run writes a directory under `out/` and pushes it to the private evals repo:
+
+```
+runs/<YYYY-MM-DD>_<run-name>/
+├── summary.json        scores, config, CoC traces -- also kept as an MLflow artifact
+├── trajectories.npz    predicted trajectories per clip
+└── samples/            one BEV + camera figure per clip
+```
+
+The run then carries `output_uri = hf:<repo>@<40-char sha>#runs/<dir>/`, so the numbers
+on MLflow and the files on Hugging Face point at each other. Uploads above 10MB per file
+or 50MB per run never go through MLflow -- the tracking server is a Jetson Orin Nano with
+one worker, and a single large upload stalls it for everyone.
+
+Ground truth is **not** stored by default. It is content from a gated NVIDIA dataset, and
+`score` already captures everything the comparison needs; `--include-gt` overrides this
+for local debugging.
+
+On exit the script prints `PASS` or `FAIL` with the missing coordinates. A `FAIL` is a
+bug in the script, not in the run.
+
+#### Recorded metrics (EC-254)
+
+Every run also logs the Tier 1 metrics the depth-pruning demonstration is judged on.
+They are all derived from the inference pass that already ran, so they cost nothing extra.
+Implementation lives in `src/alpamayo1_5/prune/metrics.py`, purely additive to upstream.
+
+| Group | Metrics |
+|---|---|
+| Accuracy | `min_ade` / `min_fde` / `mean_ade` / `mean_fde`, plus `ade_<h>` and `de_<h>` at 1, 2, 3, 4, 5 and 6.4s |
+| Kinematics | `jerk_mean` / `jerk_p95`, `lat_accel_mean` / `lat_accel_p95`, `lat_accel_over_4_ratio`, `accel_violation_rate`, `curvature_violation_rate`, `within_bounds_ratio` |
+| Reasoning | `cot_tokens_mean` / `_min` / `_max`; `meta_action` kept per clip in `summary.json` |
+| Scene | `net_heading_deg`, `lateral_offset_m`, and a `scene.<type>.count` mix over straight / curve / lane_change |
+| Size and speed | `params_billions`, `param_bytes_gb`, `vram_peak_gb`, `latency_sec_mean` / `_p95` |
+
+The horizon breakdown is the point of the accuracy group: cutting layers is expected to
+fail at distance first, and a single aggregate ADE hides exactly that.
+
+Kinematics are computed in **physical units** by projecting the prediction back through
+`traj_to_action` and denormalizing. `is_within_bounds` is reported as `within_bounds_ratio`
+but only as a hard canary -- its gates sit at roughly 12-14 sigma and it collapses all 64
+waypoints into one boolean, so it answers "did anything explode", never "is this
+comfortable to ride in".
+
+`--inference-step` is validated rather than passed through: `flow_matching.py` resolves it
+as `inference_step or self.num_inference_steps`, so `0` silently becomes the default 10 and
+quietly corrupts any latency measurement.
+
+> **Not yet covered.** Runs are **not** comparable across pruned configurations yet:
+> generation samples at `temperature=0.6`, so two runs of the same clip produce different
+> reasoning and different trajectories. Fixing the conditioning (`prune/conditioning.py`)
+> has to land before the pruning-curve table is meaningful. Also outstanding: the
+> three-way latency split (`prune/profile.py`), the egomotion scene pre-pass
+> (`prune/scene_labels.py`), trajectory-CoT agreement and hallucination
+> (`prune/cot_quality.py`), and paired bootstrap CIs.
+
+
 ### Interactive notebooks
 
 We provide notebooks that demonstrate the different capabilities of Alpamayo 1.5 under `notebooks/`, including standard model inference, incorporating navigation guidance, modifying the number of cameras, and visual question answering.
